@@ -79,11 +79,12 @@ export interface AppState {
   conn: { status: "idle" | "connecting" | "connected" | "error"; error?: string | undefined; loginid?: string | undefined };
   balance: number | null;
   currency: string;
-  tick: { price: number; digit: number; pip: number; symbol: string } | null;
+  ticks: Record<string, { price: number; digit: number; pip: number; symbol: string; prev?: number }>;
+  errors: { t: number; msg: string }[];
   trades: Trade[];
   log: { t: number; msg: string; kind: "info" | "win" | "loss" | "warn" }[];
   floating: number;
-  engine: { market: string; status: string; hourProfit: number; nextAt: number | null };
+  engine: { market: string; status: string; hourProfit: number; nextAt: number | null; cooldownUntil?: number | null; signal?: string };
 }
 
 const cc = (over?: Partial<ContractCfg>): ContractCfg => ({
@@ -133,7 +134,8 @@ let state: AppState = {
   conn: { status: "idle" },
   balance: null,
   currency: "USD",
-  tick: null,
+  ticks: {},
+  errors: [],
   trades: [],
   log: [],
   floating: 0,
@@ -164,12 +166,22 @@ export function addLog(msg: string, kind: AppState["log"][number]["kind"] = "inf
   setState((s) => ({ log: [{ t: Date.now(), msg, kind }, ...s.log].slice(0, 500) }));
 }
 
+export function addError(msg: string) {
+  setState((s) => {
+    if (s.errors[0]?.msg === msg && Date.now() - s.errors[0].t < 3000) return {};
+    return { errors: [{ t: Date.now(), msg }, ...s.errors].slice(0, 200) };
+  });
+}
+export function clearErrors() {
+  setState(() => ({ errors: [] }));
+}
+
 let hydrated = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 function writeNow() {
-  const { settings, session, trades, log } = state;
+  const { settings, session, trades, log, errors } = state;
   try {
-    localStorage.setItem(KEY, JSON.stringify({ settings, session, trades, log }));
+    localStorage.setItem(KEY, JSON.stringify({ settings, session, trades, log, errors }));
   } catch {
     /* quota */
   }
@@ -201,6 +213,7 @@ export function hydrate() {
         session: p.session ?? state.session,
         trades: p.trades ?? [],
         log: p.log ?? [],
+        errors: p.errors ?? [],
       };
     }
   } catch {
