@@ -23,6 +23,14 @@ interface Candidate {
 // ---------- connection / live ticks ----------
 let tickSubId: string | null = null;
 let wired = false;
+const priceBuf: Record<string, { prices: number[]; digits: number[] }> = {};
+const lastPrice: Record<string, number> = {};
+type TickInfo = { price: number; digit: number };
+let tickWaiters: { symbol: string; resolve: (t: TickInfo) => void }[] = [];
+
+function waitNextTick(symbol: string) {
+  return new Promise<TickInfo>((resolve) => tickWaiters.push({ symbol, resolve }));
+}
 
 function wire() {
   if (wired) return;
@@ -33,9 +41,20 @@ function wire() {
     }
     if (m.msg_type === "tick" && m.tick) {
       const pip = m.tick.pip_size ?? 2;
-      setState(() => ({
-        tick: { price: m.tick.quote, pip, digit: lastDigit(m.tick.quote, pip), symbol: m.tick.symbol },
-      }));
+      const sym: string = m.tick.symbol;
+      const price = Number(m.tick.quote);
+      const digit = lastDigit(price, pip);
+      setState(() => ({ tick: { price, pip, digit, symbol: sym } }));
+      const b = (priceBuf[sym] ??= { prices: [], digits: [] });
+      b.prices = [...b.prices, price].slice(-200);
+      b.digits = [...b.digits, digit].slice(-200);
+      lastPrice[sym] = price;
+      // settle pending every-tick trades on THIS tick
+      const ready = tickWaiters.filter((w) => w.symbol === sym);
+      tickWaiters = tickWaiters.filter((w) => w.symbol !== sym);
+      ready.forEach((w) => w.resolve({ price, digit }));
+      // then auto-trade on the SAME tick
+      if (loop && getState().settings.tradeSpeed === "tick") queueMicrotask(() => void tickLoop());
     }
     if (m.msg_type === "__closed") {
       setState(() => ({ conn: { status: "idle", error: "Disconnected" } }));
@@ -199,8 +218,11 @@ async function tickLoop() {
     scheduledAt = Date.now() + 15_000;
   } finally {
     busy = false;
+    // Every Tick: martingale already updated, fire next trade on the settling tick
+    if (loop && getState().settings.tradeSpeed === "tick") setTimeout(() => void tickLoop(), 0);
   }
-  scheduledAt = Math.max(scheduledAt, Date.now() + 2000 + Math.random() * 4000);
+  if (getState().settings.tradeSpeed !== "tick")
+    scheduledAt = Math.max(scheduledAt, Date.now() + 2000 + Math.random() * 4000);
 }
 
 function maybeSwitchMarket() {
@@ -302,8 +324,12 @@ async function runTrade() {
   const s = getState();
   const st = s.settings;
   const symbol = s.engine.market;
+  const tickMode = st.tradeSpeed === "tick";
   eng({ status: `Analysing ${marketName(symbol)}` });
-  const { digits, prices } = await recentTicks(symbol);
+  if (tickMode && getState().tick?.symbol !== symbol) await watchMarket(symbol);
+  const buf = priceBuf[symbol];
+  const { digits, prices } =
+    tickMode && buf && buf.prices.length >= 30 ? buf : await recentTicks(symbol);
   let cands = buildCandidates(digits, prices);
   if (!cands.length) {
     addLog("No eligible contracts this hour (limits reached) — waiting", "warn");
@@ -342,7 +368,7 @@ async function runTrade() {
     basis: "stake",
     contract_type: DERIV_TYPE[chosen.type],
     currency: s.currency,
-    duration: cfg.ticks,
+    duration: tickMode ? 1 : cfg.ticks,
     duration_unit: "t",
   };
   if (chosen.pred !== undefined) contractParams["barrier"] = String(chosen.pred);
@@ -372,20 +398,38 @@ async function runTrade() {
     cid = buy.buy.contract_id;
     payout = Number(buy.buy.payout ?? 0);
   }
+  const entryPrice = lastPrice[symbol] ?? 0;
   addLog(`Bought ${label(chosen)} on ${marketName(symbol)} · stake ${stake.toFixed(2)} · payout ${payout.toFixed(2)}`);
 
-  const profit = await new Promise<number>((resolve) => {
-    const off = deriv.onMessage((m) => {
-      const poc = m.proposal_open_contract;
-      if (m.msg_type !== "proposal_open_contract" || !poc || poc.contract_id !== cid) return;
-      setState(() => ({ floating: poc.profit ?? 0 }));
-      if (poc.is_sold) {
-        off();
-        resolve(Number(poc.profit));
-      }
+  let profit: number;
+  if (tickMode) {
+    // Every Tick: settle on the very next tick ourselves, no waiting for Deriv's settlement
+    const next = await waitNextTick(symbol);
+    const d = next.digit;
+    const p = chosen.pred ?? 0;
+    const win =
+      chosen.type === "EVEN" ? d % 2 === 0 :
+      chosen.type === "ODD" ? d % 2 === 1 :
+      chosen.type === "OVER" ? d > p :
+      chosen.type === "UNDER" ? d < p :
+      chosen.type === "DIFFERS" ? d !== p :
+      chosen.type === "RISE" ? next.price > entryPrice :
+      next.price < entryPrice;
+    profit = win ? payout - stake : -stake;
+  } else {
+    profit = await new Promise<number>((resolve) => {
+      const off = deriv.onMessage((m) => {
+        const poc = m.proposal_open_contract;
+        if (m.msg_type !== "proposal_open_contract" || !poc || poc.contract_id !== cid) return;
+        setState(() => ({ floating: poc.profit ?? 0 }));
+        if (poc.is_sold) {
+          off();
+          resolve(Number(poc.profit));
+        }
+      });
+      deriv.send({ proposal_open_contract: 1, contract_id: cid, subscribe: 1 }).catch(() => {});
     });
-    deriv.send({ proposal_open_contract: 1, contract_id: cid, subscribe: 1 }).catch(() => {});
-  });
+  }
   setState(() => ({ floating: 0 }));
 
   const trade: Trade = {

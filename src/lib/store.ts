@@ -59,6 +59,7 @@ export interface Settings {
   mgMaxSteps: number;
   recoveryMode: "same" | "different" | "auto";
   recoveryCoverage: number; // percent
+  tradeSpeed: "normal" | "tick";
 }
 
 export interface Trade {
@@ -123,6 +124,7 @@ export const defaultSettings: Settings = {
   mgMaxSteps: 3,
   recoveryMode: "auto",
   recoveryCoverage: 80,
+  tradeSpeed: "normal",
 };
 
 let state: AppState = {
@@ -164,15 +166,26 @@ export function addLog(msg: string, kind: AppState["log"][number]["kind"] = "inf
 
 let hydrated = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+function writeNow() {
+  const { settings, session, trades, log } = state;
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ settings, session, trades, log }));
+  } catch {
+    /* quota */
+  }
+}
 function persist() {
   if (!hydrated || typeof window === "undefined") return;
   if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    const { settings, session, trades, log } = state;
-    localStorage.setItem(KEY, JSON.stringify({ settings, session, trades, log }));
-  }, 300);
+  persistTimer = setTimeout(writeNow, 300);
 }
 export function hydrate() {
+  if (typeof window !== "undefined" && !hydrated) {
+    const flush = () => hydrated && writeNow();
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && flush());
+  }
   if (hydrated) return;
   try {
     const raw = localStorage.getItem(KEY);
