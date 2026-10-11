@@ -110,7 +110,7 @@ export function launchEngine() {
   marketIdx = 0;
   marketStartedAt = Date.now();
   marketTrades = 0;
-  eng({ market: markets[0], status: "Running" });
+  eng({ market: markets[0]!, status: "Running" });
   setState((st) => ({ session: { ...st.session, launched: true } }));
   addLog("Megatron AI launched");
   curHour = -1;
@@ -207,7 +207,7 @@ function maybeSwitchMarket() {
   const st = getState().settings;
   const markets = activeMarkets();
   if (markets.length < 2) {
-    eng({ market: markets[0] });
+    eng({ market: markets[0]! });
     return;
   }
   const cur = getState().engine.market;
@@ -227,8 +227,8 @@ function maybeSwitchMarket() {
     const next = markets[marketIdx];
     marketStartedAt = Date.now();
     marketTrades = 0;
-    eng({ market: next });
-    if (reason) addLog(`Switching ${marketName(cur)} → ${marketName(next)} (${reason})`);
+    eng({ market: next! });
+    if (reason) addLog(`Switching ${marketName(cur)} → ${marketName(next!)} (${reason})`);
   }
 }
 
@@ -245,7 +245,7 @@ function buildCandidates(digits: number[], prices: number[]): Candidate[] {
   const freq = Array.from({ length: 10 }, (_, d) => digits.filter((x) => x === d).length / n);
   const evenF = freq.filter((_, d) => d % 2 === 0).reduce((a, b) => a + b, 0);
   const last20 = prices.slice(-20);
-  const trend = last20.length > 1 ? Math.sign(last20[last20.length - 1] - last20[0]) : 0;
+  const trend = last20.length > 1 ? Math.sign(last20[last20.length - 1]! - last20[0]!) : 0;
   // volatility (std of returns) to penalise choppy markets
   const out: Candidate[] = [];
   for (const k of CONTRACTS) {
@@ -262,7 +262,7 @@ function buildCandidates(digits: number[], prices: number[]): Candidate[] {
         let p = 0;
         if (k === "OVER" && d <= 8) p = (9 - d) / 10 + (freq.slice(d + 1).reduce((a, b) => a + b, 0) - (9 - d) / 10) * 0.2;
         if (k === "UNDER" && d >= 1) p = d / 10 + (freq.slice(0, d).reduce((a, b) => a + b, 0) - d / 10) * 0.2;
-        if (k === "DIFFERS") p = 0.9 + (0.1 - freq[d]) * 0.3;
+        if (k === "DIFFERS") p = 0.9 + (0.1 - freq[d]!) * 0.3;
         if (p > 0) out.push({ type: k, pred: d, prob: p });
       }
     } else if (k === "EVEN") out.push({ type: k, prob: 0.5 + (evenF - 0.5) * 0.3 });
@@ -292,10 +292,10 @@ function pick(cands: Candidate[]): Candidate {
   const total = w.reduce((a, b) => a + b, 0);
   let r = Math.random() * total;
   for (let i = 0; i < cands.length; i++) {
-    r -= w[i];
-    if (r <= 0) return cands[i];
+    r -= w[i]!;
+    if (r <= 0) return cands[i]!;
   }
-  return cands[0];
+  return cands[0]!;
 }
 
 async function runTrade() {
@@ -347,7 +347,7 @@ async function runTrade() {
     duration_unit: "t",
     symbol,
   };
-  if (chosen.pred !== undefined) req.barrier = String(chosen.pred);
+  if (chosen.pred !== undefined) req["barrier"] = String(chosen.pred);
   eng({ status: `Buying ${label(chosen)}` });
   const prop = await deriv.send(req);
   const payout = prop.proposal.payout as number;
