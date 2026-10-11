@@ -324,7 +324,7 @@ async function runTrade() {
       .map((c) => ({ c, cov: coverage(stake, estProfitRatio(c.prob), lossAccum) }))
       .sort((a, b) => b.c.prob - a.c.prob);
     const ok = scored.filter((x) => x.cov >= need);
-    const best = ok[0] ?? scored.sort((a, b) => b.cov - a.cov)[0];
+    const best = ok[0] ?? scored.sort((a, b) => b.cov - a.cov)[0]!;
     chosen = best.c;
     addLog(
       `Recovery step ${mgStep}: ${label(chosen)} stake ${stake.toFixed(2)} · expected profit ${(stake * estProfitRatio(chosen.prob)).toFixed(2)} covers ${(best.cov * 100).toFixed(0)}% of loss ${lossAccum.toFixed(2)}${ok.length ? "" : " (below target — best available)"}`,
