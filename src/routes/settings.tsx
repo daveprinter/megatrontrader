@@ -77,6 +77,22 @@ function SettingsPage() {
         )}
       </Panel>
 
+      <Panel title="Trade Speed">
+        <Segmented
+          value={s.tradeSpeed}
+          options={[
+            { value: "normal", label: "Normal Speed" },
+            { value: "tick", label: "Every Tick Speed" },
+          ]}
+          onChange={(v) => updateSettings({ tradeSpeed: v })}
+        />
+        <p className="mt-2 text-xs text-muted-foreground">
+          {s.tradeSpeed === "normal"
+            ? "Waits for each contract to settle on Deriv before sending the next."
+            : "Trades on every tick: each 1-tick contract is settled on the next tick and the next trade (with martingale applied instantly) goes out on that same tick."}
+        </p>
+      </Panel>
+
       <Panel title="Targets">
         <div className="grid grid-cols-2 gap-3">
           <NumField label="Profit per hour ($)" value={s.hourlyTarget} step={0.1} onChange={(n) => updateSettings({ hourlyTarget: n })} />
