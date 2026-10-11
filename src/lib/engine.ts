@@ -337,26 +337,41 @@ async function runTrade() {
   stake = Math.max(MIN_STAKE, round2(stake));
 
   const cfg = st.contracts[chosen.type];
-  const req: Record<string, any> = {
-    proposal: 1,
+  const contractParams: Record<string, any> = {
     amount: stake,
     basis: "stake",
     contract_type: DERIV_TYPE[chosen.type],
     currency: s.currency,
     duration: cfg.ticks,
     duration_unit: "t",
-    symbol,
   };
-  if (chosen.pred !== undefined) req["barrier"] = String(chosen.pred);
+  if (chosen.pred !== undefined) contractParams["barrier"] = String(chosen.pred);
   eng({ status: `Buying ${label(chosen)}` });
-  const prop = await deriv.send(req);
-  const payout = prop.proposal.payout as number;
-  if (recovering) {
-    const realCov = coverage(stake, payout / stake - 1, lossAccum);
-    addLog(`Payout ${payout.toFixed(2)} → real coverage ${(realCov * 100).toFixed(0)}%`);
+
+  let payout: number;
+  let cid: number;
+  if (deriv.mode === "pat") {
+    // PAT: proposal (with underlying_symbol) -> buy by proposal id
+    const prop = await deriv.send({ proposal: 1, ...contractParams, underlying_symbol: symbol });
+    const proposalId = prop?.proposal?.id;
+    if (!proposalId) throw new Error("Deriv did not return a proposal ID");
+    payout = prop.proposal.payout as number;
+    if (recovering) {
+      const realCov = coverage(stake, payout / stake - 1, lossAccum);
+      addLog(`Payout ${payout.toFixed(2)} → real coverage ${(realCov * 100).toFixed(0)}%`);
+    }
+    const buy = await deriv.send({ buy: proposalId, price: stake });
+    cid = buy.buy.contract_id;
+  } else {
+    // Legacy: direct buy with parameters
+    const buy = await deriv.send({
+      buy: 1,
+      price: stake,
+      parameters: { ...contractParams, symbol },
+    });
+    cid = buy.buy.contract_id;
+    payout = Number(buy.buy.payout ?? 0);
   }
-  const buy = await deriv.send({ buy: prop.proposal.id, price: stake });
-  const cid = buy.buy.contract_id;
   addLog(`Bought ${label(chosen)} on ${marketName(symbol)} · stake ${stake.toFixed(2)} · payout ${payout.toFixed(2)}`);
 
   const profit = await new Promise<number>((resolve) => {
