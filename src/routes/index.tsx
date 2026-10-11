@@ -41,7 +41,7 @@ function Home() {
   const conn = useApp((x) => x.conn);
   const balance = useApp((x) => x.balance);
   const currency = useApp((x) => x.currency);
-  const tick = useApp((x) => x.tick);
+  const tick = useApp((x) => x.ticks[x.settings.market] ?? null);
   const session = useApp((x) => x.session);
   const engine = useApp((x) => x.engine);
   const [open, setOpen] = useState<ContractKey | null>(null);

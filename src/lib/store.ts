@@ -79,7 +79,7 @@ export interface AppState {
   conn: { status: "idle" | "connecting" | "connected" | "error"; error?: string | undefined; loginid?: string | undefined };
   balance: number | null;
   currency: string;
-  ticks: Record<string, { price: number; digit: number; pip: number; symbol: string; prev?: number }>;
+  ticks: Record<string, { price: number; digit: number; pip: number; symbol: string; prev?: number | undefined }>;
   errors: { t: number; msg: string }[];
   trades: Trade[];
   log: { t: number; msg: string; kind: "info" | "win" | "loss" | "warn" }[];
