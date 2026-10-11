@@ -90,3 +90,17 @@
   .num { @apply font-mono tabular-nums; }
   .glow-text { @apply text-primary; text-shadow: 0 0 18px oklch(0.78 0.17 62 / 55%); }
 }
+
+/* Visually hide the Lovable badge overlay without disabling it in project settings. */
+#lovable-badge,
+a#lovable-badge,
+[id^="lovable-badge"],
+[class*="lovable-badge"],
+a[href*="lovable.dev/projects"],
+a[href*="lovable.dev?utm"],
+a[href*="lovable.dev/?utm"] {
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
