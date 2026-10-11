@@ -1,6 +1,6 @@
 // Minimal Deriv WebSocket client. The PAT connection can be swapped for the
 // user's exact code inside `connect()`.
-type Msg = Record<string, any>;
+type Msg = any;
 type Listener = (m: Msg) => void;
 
 const APP_ID = 1089;

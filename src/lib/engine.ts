@@ -16,7 +16,7 @@ const HOUR = 3600_000;
 
 interface Candidate {
   type: ContractKey;
-  pred?: number;
+  pred?: number | undefined;
   prob: number;
 }
 

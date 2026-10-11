@@ -65,7 +65,7 @@ export interface Trade {
   id: string;
   time: number;
   type: ContractKey;
-  pred?: number;
+  pred?: number | undefined;
   symbol: string;
   stake: number;
   profit: number;
@@ -75,7 +75,7 @@ export interface Trade {
 export interface AppState {
   settings: Settings;
   session: { startedAt: number | null; launched: boolean };
-  conn: { status: "idle" | "connecting" | "connected" | "error"; error?: string; loginid?: string };
+  conn: { status: "idle" | "connecting" | "connected" | "error"; error?: string | undefined; loginid?: string | undefined };
   balance: number | null;
   currency: string;
   tick: { price: number; digit: number; pip: number; symbol: string } | null;
