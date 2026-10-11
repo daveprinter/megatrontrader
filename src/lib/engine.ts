@@ -218,6 +218,8 @@ async function tickLoop() {
     scheduledAt = Date.now() + 15_000;
   } finally {
     busy = false;
+    // Every Tick: martingale already updated, fire next trade on the settling tick
+    if (loop && getState().settings.tradeSpeed === "tick") setTimeout(() => void tickLoop(), 0);
   }
   if (getState().settings.tradeSpeed !== "tick")
     scheduledAt = Math.max(scheduledAt, Date.now() + 2000 + Math.random() * 4000);
