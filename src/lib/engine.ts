@@ -1,69 +1,101 @@
-import { deriv, lastDigit } from "./deriv";
+import { deriv } from "./deriv";
+import { feed } from "./feed";
 import { coverage, estProfitRatio, martingaleStake, MIN_STAKE, round2 } from "./martingale";
+import { analyse, type Signal } from "./signals";
 import {
+  addError,
   addLog,
   CONTRACTS,
   type ContractKey,
   DERIV_TYPE,
   getState,
-  HAS_PREDICTION,
   marketName,
   setState,
   type Trade,
 } from "./store";
 
 const HOUR = 3600_000;
+const LOSS_COOLDOWN_AFTER = 3; // consecutive losses
+const LOSS_COOLDOWN_MS = 3 * 60_000;
+const ERROR_COOLDOWN_AFTER = 3; // consecutive errors
+const ERROR_COOLDOWN_MS = 2 * 60_000;
 
-interface Candidate {
-  type: ContractKey;
-  pred?: number | undefined;
-  prob: number;
-}
-
-// ---------- connection / live ticks ----------
-let tickSubId: string | null = null;
-let wired = false;
+// ---------- live market data ----------
 const priceBuf: Record<string, { prices: number[]; digits: number[] }> = {};
 const lastPrice: Record<string, number> = {};
 type TickInfo = { price: number; digit: number };
 let tickWaiters: { symbol: string; resolve: (t: TickInfo) => void }[] = [];
+let feedWired = false;
+let accountWired = false;
 
 function waitNextTick(symbol: string) {
   return new Promise<TickInfo>((resolve) => tickWaiters.push({ symbol, resolve }));
 }
 
-function wire() {
-  if (wired) return;
-  wired = true;
+function wireFeed() {
+  if (feedWired) return;
+  feedWired = true;
+  feed.onHistory = (sym, prices, pip) => {
+    const digits = prices.map((p) => Number(p.toFixed(pip).slice(-1)));
+    priceBuf[sym] = { prices: prices.slice(-200), digits: digits.slice(-200) };
+    const p = prices[prices.length - 1];
+    if (p !== undefined) {
+      lastPrice[sym] = p;
+      setState((s) => ({ ticks: { ...s.ticks, [sym]: { symbol: sym, price: p, pip, digit: digits[digits.length - 1]! } } }));
+    }
+  };
+  feed.onTick = ({ symbol: sym, price, digit, pip }) => {
+    const b = (priceBuf[sym] ??= { prices: [], digits: [] });
+    b.prices.push(price);
+    b.digits.push(digit);
+    if (b.prices.length > 200) {
+      b.prices.shift();
+      b.digits.shift();
+    }
+    const prev = lastPrice[sym];
+    lastPrice[sym] = price;
+    setState((s) => ({ ticks: { ...s.ticks, [sym]: { symbol: sym, price, pip, digit, prev } } }));
+    const ready = tickWaiters.filter((w) => w.symbol === sym);
+    tickWaiters = tickWaiters.filter((w) => w.symbol !== sym);
+    ready.forEach((w) => w.resolve({ price, digit }));
+    // analysis runs on every incoming tick while launched
+    if (loop) queueMicrotask(() => void tickLoop());
+  };
+  feed.onError = (msg) => addError(msg);
+}
+
+/** Keep the live feed subscribed to every market the UI or the AI needs. */
+export function syncFeed() {
+  wireFeed();
+  const st = getState().settings;
+  const syms = new Set<string>([st.market, getState().engine.market]);
+  if (st.multiMarket) st.markets.forEach((m) => syms.add(m));
+  feed.setSymbols([...syms]);
+}
+
+/** Kept for existing callers: switching market just re-syncs the live feed. */
+export async function watchMarket(_symbol?: string) {
+  setTimeout(syncFeed, 0);
+}
+
+function wireAccount() {
+  if (accountWired) return;
+  accountWired = true;
   deriv.onMessage((m) => {
     if (m.msg_type === "balance" && m.balance) {
       setState(() => ({ balance: m.balance.balance, currency: m.balance.currency }));
     }
-    if (m.msg_type === "tick" && m.tick) {
-      const pip = m.tick.pip_size ?? 2;
-      const sym: string = m.tick.symbol;
-      const price = Number(m.tick.quote);
-      const digit = lastDigit(price, pip);
-      setState(() => ({ tick: { price, pip, digit, symbol: sym } }));
-      const b = (priceBuf[sym] ??= { prices: [], digits: [] });
-      b.prices = [...b.prices, price].slice(-200);
-      b.digits = [...b.digits, digit].slice(-200);
-      lastPrice[sym] = price;
-      // settle pending every-tick trades on THIS tick
-      const ready = tickWaiters.filter((w) => w.symbol === sym);
-      tickWaiters = tickWaiters.filter((w) => w.symbol !== sym);
-      ready.forEach((w) => w.resolve({ price, digit }));
-      // then auto-trade on the SAME tick
-      if (loop && getState().settings.tradeSpeed === "tick") queueMicrotask(() => void tickLoop());
-    }
     if (m.msg_type === "__closed") {
       setState(() => ({ conn: { status: "idle", error: "Disconnected" } }));
+      addError("Deriv account connection closed");
     }
+    if (m.error && m.msg_type !== "ping") addError(`Deriv API: ${m.error.message}`);
   });
 }
 
 export async function connectAccount() {
-  wire();
+  wireAccount();
+  syncFeed();
   const token = getState().settings.token;
   if (!token) return;
   setState(() => ({ conn: { status: "connecting" } }));
@@ -74,10 +106,10 @@ export async function connectAccount() {
       balance: a.balance,
       currency: a.currency,
     }));
-    addLog(`Connected to ${a.loginid}`);
-    await watchMarket(getState().settings.market);
+    addLog(`Connected to ${a.loginid} (${a.mode.toUpperCase()})`);
   } catch (e: any) {
     setState(() => ({ conn: { status: "error", error: e.message } }));
+    addError(`Connect failed: ${e.message}`);
   }
 }
 
@@ -87,22 +119,11 @@ export function disconnectAccount() {
   setState(() => ({ conn: { status: "idle" }, balance: null }));
 }
 
-export async function watchMarket(symbol: string) {
-  wire();
-  try {
-    if (tickSubId) await deriv.send({ forget: tickSubId }).catch(() => {});
-    const r = await deriv.send({ ticks: symbol, subscribe: 1 });
-    tickSubId = r.subscription?.id ?? null;
-  } catch (e: any) {
-    addLog(`Tick stream error: ${e.message}`, "warn");
-  }
-}
-
 // ---------- engine state ----------
 let loop: ReturnType<typeof setInterval> | null = null;
 let busy = false;
 let curHour = -1;
-let scheduledAt = 0;
+let nextAllowed = 0;
 let hourProfit = 0;
 let targetLogged = false;
 let hourTypeTrades: Partial<Record<ContractKey, number>> = {};
@@ -114,7 +135,10 @@ let lastStake = 0;
 let lastType: ContractKey | null = null;
 let marketStartedAt = Date.now();
 let marketTrades = 0;
-let marketIdx = 0;
+let consecLosses = 0;
+let consecErrors = 0;
+let cooldownUntil = 0;
+let lastScanLog = 0;
 
 const eng = (patch: Partial<ReturnType<typeof getState>["engine"]>) =>
   setState((s) => ({ engine: { ...s.engine, ...patch } }));
@@ -126,12 +150,15 @@ export function launchEngine() {
   if (!CONTRACTS.some((k) => s.settings.contracts[k].enabled))
     return addLog("Select at least one contract type", "warn");
   const markets = activeMarkets();
-  marketIdx = 0;
   marketStartedAt = Date.now();
   marketTrades = 0;
-  eng({ market: markets[0]!, status: "Running" });
+  consecErrors = 0;
+  cooldownUntil = 0;
+  nextAllowed = 0;
+  eng({ market: markets[0]!, status: "Scanning markets", cooldownUntil: null });
   setState((st) => ({ session: { ...st.session, launched: true } }));
-  addLog("Megatron AI launched");
+  syncFeed();
+  addLog(`Megatron AI launched — analysing ${markets.map(marketName).join(", ")}`);
   curHour = -1;
   if (loop) clearInterval(loop);
   loop = setInterval(tickLoop, 1000);
@@ -141,10 +168,9 @@ export function stopEngine() {
   if (loop) clearInterval(loop);
   loop = null;
   setState((st) => ({ session: { ...st.session, launched: false } }));
-  eng({ status: "Stopped", nextAt: null });
+  eng({ status: "Stopped", nextAt: null, cooldownUntil: null, signal: "" });
 }
 
-/** Resume automatically after a page reload when session was launched. */
 export function resumeIfLaunched() {
   const s = getState();
   if (s.session.launched && s.conn.status === "connected" && !loop) launchEngine();
@@ -155,13 +181,18 @@ function activeMarkets() {
   return s.multiMarket && s.markets.length ? s.markets : [s.market];
 }
 
+function startCooldown(ms: number, why: string) {
+  cooldownUntil = Date.now() + ms;
+  eng({ cooldownUntil, status: `Cooldown (${why})` });
+  addLog(`Cooldown ${Math.round(ms / 60000)} min — ${why}. Recovery resumes after.`, "warn");
+}
+
 async function tickLoop() {
-  if (busy) return;
+  if (busy || !loop) return;
   const s = getState();
   const st = s.settings;
   const now = Date.now();
 
-  // stop loss on session
   const sessionPnl = s.trades
     .filter((t) => s.session.startedAt && t.time >= s.session.startedAt)
     .reduce((a, t) => a + t.profit, 0);
@@ -172,13 +203,10 @@ async function tickLoop() {
 
   const hk = Math.floor(now / HOUR);
   if (hk !== curHour) {
+    if (curHour !== -1) addLog("New hour — hourly target reset");
     curHour = hk;
     hourProfit = 0;
     targetLogged = false;
-    const hourEnd = (hk + 1) * HOUR;
-    const window = Math.max(0, hourEnd - now - 12 * 60_000);
-    scheduledAt = now + Math.random() * window;
-    // carry banned types from previous hour, then reset counters
     bannedTypes = new Set(
       (Object.keys(hourTypeLosses) as ContractKey[]).filter(
         (k) => st.tradeMode === "manual" && (hourTypeLosses[k] ?? 0) >= st.typeMaxLosses,
@@ -186,113 +214,111 @@ async function tickLoop() {
     );
     hourTypeTrades = {};
     hourTypeLosses = {};
-    eng({ hourProfit: 0, nextAt: scheduledAt });
-    addLog(`New hour — trading window opens at ${new Date(scheduledAt).toLocaleTimeString("en-US", { timeZone: "Africa/Nairobi" })} EAT`);
+    eng({ hourProfit: 0, nextAt: null });
   }
 
-  // daily active window
   const elapsed = (now - (s.session.startedAt ?? now)) % (24 * HOUR);
-  if (elapsed >= st.hoursPerDay * HOUR) {
-    eng({ status: "Resting (daily hours done)" });
-    return;
-  }
+  if (elapsed >= st.hoursPerDay * HOUR) return eng({ status: "Resting (daily hours done)" });
   if (hourProfit >= st.hourlyTarget) {
     if (!targetLogged) {
       targetLogged = true;
-      addLog(`Hourly target $${st.hourlyTarget} reached — waiting for next hour`, "win");
+      addLog(`Hourly target $${st.hourlyTarget} reached — resting until next hour`, "win");
     }
-    eng({ status: "Target reached · waiting" });
-    return;
+    return eng({ status: "Target reached · resting", nextAt: (hk + 1) * HOUR });
   }
-  if (now < scheduledAt) {
-    eng({ status: "Waiting for random window" });
+  if (now < cooldownUntil) return;
+  if (cooldownUntil) {
+    cooldownUntil = 0;
+    consecLosses = 0;
+    consecErrors = 0;
+    eng({ cooldownUntil: null });
+    addLog("Cooldown over — scanning for entries");
+  }
+  if (now < nextAllowed) return;
+
+  maybeSwitchMarket();
+  const pickRes = findSignal();
+  if (!pickRes) {
+    if (now - lastScanLog > 1000) {
+      lastScanLog = now;
+      const m = getState().engine.market;
+      const ready = (priceBuf[m]?.digits.length ?? 0) >= 50;
+      eng({ status: ready ? "Analysing · waiting for entry" : `Loading data for ${marketName(m)}`, signal: "" });
+    }
     return;
   }
 
   busy = true;
   try {
-    maybeSwitchMarket();
-    await runTrade();
+    await runTrade(pickRes.symbol, pickRes.cands);
+    consecErrors = 0;
   } catch (e: any) {
+    consecErrors++;
+    addError(`Trade error: ${e.message}`);
     addLog(`Trade error: ${e.message}`, "warn");
-    scheduledAt = Date.now() + 15_000;
+    nextAllowed = Date.now() + 5000;
+    if (consecErrors >= ERROR_COOLDOWN_AFTER) startCooldown(ERROR_COOLDOWN_MS, `${consecErrors} errors in a row`);
   } finally {
     busy = false;
-    // Every Tick: martingale already updated, fire next trade on the settling tick
-    if (loop && getState().settings.tradeSpeed === "tick") setTimeout(() => void tickLoop(), 0);
   }
-  if (getState().settings.tradeSpeed !== "tick")
-    scheduledAt = Math.max(scheduledAt, Date.now() + 2000 + Math.random() * 4000);
+  if (getState().settings.tradeSpeed !== "tick") nextAllowed = Math.max(nextAllowed, Date.now() + 1500);
+  if (consecLosses >= LOSS_COOLDOWN_AFTER && !cooldownUntil)
+    startCooldown(LOSS_COOLDOWN_MS, `${consecLosses} losses in a row`);
+}
+
+/** Scan active markets and return the best one with live entry signals. */
+function findSignal(): { symbol: string; cands: Signal[] } | null {
+  const st = getState().settings;
+  const auto = st.multiMarket && st.marketMode === "auto";
+  const markets = auto ? activeMarkets() : [getState().engine.market];
+  let best: { symbol: string; cands: Signal[]; edge: number } | null = null;
+  for (const m of markets) {
+    const b = priceBuf[m];
+    if (!b || b.digits.length < 50) continue;
+    const cands = analyse(b.digits, b.prices, st.contracts).filter(eligible);
+    if (!cands.length) continue;
+    const edge = Math.max(...cands.map((c) => c.edge));
+    if (!best || edge > best.edge) best = { symbol: m, cands, edge };
+  }
+  if (best && auto && best.symbol !== getState().engine.market) {
+    addLog(`Market fit: ${marketName(best.symbol)} shows the strongest setup`);
+    eng({ market: best.symbol });
+    marketStartedAt = Date.now();
+    marketTrades = 0;
+  }
+  return best;
+}
+
+function eligible(c: Signal) {
+  const st = getState().settings;
+  if (st.tradeMode !== "manual") return true;
+  if ((hourTypeTrades[c.type] ?? 0) >= st.typeMaxTrades) return false;
+  if ((hourTypeLosses[c.type] ?? 0) >= st.typeMaxLosses) return false;
+  return !bannedTypes.has(c.type);
 }
 
 function maybeSwitchMarket() {
   const st = getState().settings;
   const markets = activeMarkets();
+  const cur = getState().engine.market;
   if (markets.length < 2) {
-    eng({ market: markets[0]! });
+    if (cur !== markets[0]) eng({ market: markets[0]! });
     return;
   }
-  const cur = getState().engine.market;
-  let reason = "";
-  if (st.marketMode === "manual") {
-    if (marketTrades >= st.marketMaxTrades) reason = `max ${st.marketMaxTrades} trades reached`;
-    else if (Date.now() - marketStartedAt >= st.marketMaxHours * HOUR) reason = `max ${st.marketMaxHours}h runtime reached`;
-  } else {
-    const recent = getState().trades.filter((t) => t.symbol === cur).slice(0, 8);
-    const losses = recent.filter((t) => t.profit < 0).length;
-    const pnl = recent.reduce((a, t) => a + t.profit, 0);
-    if (recent.length >= 4 && losses >= 3) reason = `${losses} recent losses`;
-    else if (recent.length >= 6 && pnl > st.hourlyTarget * 2) reason = "banking profit before market turns";
+  if (st.marketMode !== "manual") {
+    if (!markets.includes(cur)) eng({ market: markets[0]! });
+    return;
   }
+  let reason = "";
+  if (marketTrades >= st.marketMaxTrades) reason = `max ${st.marketMaxTrades} trades reached`;
+  else if (Date.now() - marketStartedAt >= st.marketMaxHours * HOUR) reason = `max ${st.marketMaxHours}h runtime reached`;
   if (reason || !markets.includes(cur)) {
-    marketIdx = (markets.indexOf(cur) + 1) % markets.length;
-    const next = markets[marketIdx];
+    const next = markets[(markets.indexOf(cur) + 1) % markets.length]!;
     marketStartedAt = Date.now();
     marketTrades = 0;
-    eng({ market: next! });
-    if (reason) addLog(`Switching ${marketName(cur)} → ${marketName(next!)} (${reason})`);
+    eng({ market: next });
+    if (reason) addLog(`Switching ${marketName(cur)} → ${marketName(next)} (${reason})`);
   }
-}
-
-async function recentTicks(symbol: string) {
-  const r = await deriv.send({ ticks_history: symbol, count: 120, end: "latest", style: "ticks" });
-  const prices: number[] = r.history.prices;
-  const pip = r.pip_size ?? 2;
-  return { prices, digits: prices.map((p) => lastDigit(p, pip)) };
-}
-
-function buildCandidates(digits: number[], prices: number[]): Candidate[] {
-  const st = getState().settings;
-  const n = digits.length || 1;
-  const freq = Array.from({ length: 10 }, (_, d) => digits.filter((x) => x === d).length / n);
-  const evenF = freq.filter((_, d) => d % 2 === 0).reduce((a, b) => a + b, 0);
-  const last20 = prices.slice(-20);
-  const trend = last20.length > 1 ? Math.sign(last20[last20.length - 1]! - last20[0]!) : 0;
-  // volatility (std of returns) to penalise choppy markets
-  const out: Candidate[] = [];
-  for (const k of CONTRACTS) {
-    const c = st.contracts[k];
-    if (!c.enabled) continue;
-    if (st.tradeMode === "manual") {
-      if ((hourTypeTrades[k] ?? 0) >= st.typeMaxTrades) continue;
-      if ((hourTypeLosses[k] ?? 0) >= st.typeMaxLosses) continue;
-      if (bannedTypes.has(k)) continue;
-    }
-    if (HAS_PREDICTION.includes(k)) {
-      const preds = c.predMode === "single" ? c.preds.slice(0, 1) : c.preds;
-      for (const d of preds) {
-        let p = 0;
-        if (k === "OVER" && d <= 8) p = (9 - d) / 10 + (freq.slice(d + 1).reduce((a, b) => a + b, 0) - (9 - d) / 10) * 0.2;
-        if (k === "UNDER" && d >= 1) p = d / 10 + (freq.slice(0, d).reduce((a, b) => a + b, 0) - d / 10) * 0.2;
-        if (k === "DIFFERS") p = 0.9 + (0.1 - freq[d]!) * 0.3;
-        if (p > 0) out.push({ type: k, pred: d, prob: p });
-      }
-    } else if (k === "EVEN") out.push({ type: k, prob: 0.5 + (evenF - 0.5) * 0.3 });
-    else if (k === "ODD") out.push({ type: k, prob: 0.5 + (0.5 - evenF) * 0.3 });
-    else if (k === "RISE") out.push({ type: k, prob: 0.5 + trend * 0.03 });
-    else if (k === "FALL") out.push({ type: k, prob: 0.5 - trend * 0.03 });
-  }
-  return out;
 }
 
 function typePerf(k: ContractKey) {
@@ -301,50 +327,32 @@ function typePerf(k: ContractKey) {
   return Math.pow(0.85, losses);
 }
 
-function baseStake(c: Candidate) {
+function baseStake(c: Signal) {
   const max = getState().settings.contracts[c.type].maxStake;
   const conf = Math.min(1, Math.max(0, (c.prob - 0.35) / 0.6));
-  const jitter = 0.85 + Math.random() * 0.15;
-  return Math.min(max, Math.max(MIN_STAKE, round2(MIN_STAKE + (max - MIN_STAKE) * conf * typePerf(c.type) * jitter)));
+  return Math.min(max, Math.max(MIN_STAKE, round2(MIN_STAKE + (max - MIN_STAKE) * conf * typePerf(c.type))));
 }
 
-function pick(cands: Candidate[]): Candidate {
-  // weighted random: favour probability × recent performance, but rotate types
-  const w = cands.map((c) => c.prob * typePerf(c.type) * (c.type === lastType ? 0.7 : 1));
-  const total = w.reduce((a, b) => a + b, 0);
-  let r = Math.random() * total;
-  for (let i = 0; i < cands.length; i++) {
-    r -= w[i]!;
-    if (r <= 0) return cands[i]!;
-  }
-  return cands[0]!;
+function pick(cands: Signal[]): Signal {
+  return [...cands].sort(
+    (a, b) => b.edge * typePerf(b.type) * (b.type === lastType ? 0.9 : 1) - a.edge * typePerf(a.type) * (a.type === lastType ? 0.9 : 1),
+  )[0]!;
 }
 
-async function runTrade() {
+async function runTrade(symbol: string, candsIn: Signal[]) {
   const s = getState();
   const st = s.settings;
-  const symbol = s.engine.market;
   const tickMode = st.tradeSpeed === "tick";
-  eng({ status: `Analysing ${marketName(symbol)}` });
-  if (tickMode && getState().tick?.symbol !== symbol) await watchMarket(symbol);
-  const buf = priceBuf[symbol];
-  const { digits, prices } =
-    tickMode && buf && buf.prices.length >= 30 ? buf : await recentTicks(symbol);
-  let cands = buildCandidates(digits, prices);
-  if (!cands.length) {
-    addLog("No eligible contracts this hour (limits reached) — waiting", "warn");
-    hourProfit = st.hourlyTarget; // park until next hour
-    return;
-  }
+  let cands = candsIn;
 
-  let chosen: Candidate;
+  let chosen: Signal;
   let stake: number;
   const recovering = st.mgEnabled && lossAccum > 0 && mgStep > 0 && mgStep < st.mgMaxSteps;
 
   if (recovering) {
     stake = martingaleStake(lastStake / Math.pow(Math.min(st.mgMultiplier, st.mgMaxMultiplier), mgStep - 1), st.mgMultiplier, mgStep, st.mgMaxSteps, st.mgMaxMultiplier);
-    if (st.recoveryMode === "same" && lastType) cands = cands.filter((c) => c.type === lastType).length ? cands.filter((c) => c.type === lastType) : cands;
-    if (st.recoveryMode === "different" && lastType) cands = cands.filter((c) => c.type !== lastType).length ? cands.filter((c) => c.type !== lastType) : cands;
+    if (st.recoveryMode === "same" && lastType && cands.some((c) => c.type === lastType)) cands = cands.filter((c) => c.type === lastType);
+    if (st.recoveryMode === "different" && lastType && cands.some((c) => c.type !== lastType)) cands = cands.filter((c) => c.type !== lastType);
     const need = st.recoveryCoverage / 100;
     const scored = cands
       .map((c) => ({ c, cov: coverage(stake, estProfitRatio(c.prob), lossAccum) }))
@@ -353,7 +361,7 @@ async function runTrade() {
     const best = ok[0] ?? scored.sort((a, b) => b.cov - a.cov)[0]!;
     chosen = best.c;
     addLog(
-      `Recovery step ${mgStep}: ${label(chosen)} stake ${stake.toFixed(2)} · expected profit ${(stake * estProfitRatio(chosen.prob)).toFixed(2)} covers ${(best.cov * 100).toFixed(0)}% of loss ${lossAccum.toFixed(2)}${ok.length ? "" : " (below target — best available)"}`,
+      `Recovery step ${mgStep}: ${label(chosen)} stake ${stake.toFixed(2)} covers ${(best.cov * 100).toFixed(0)}% of loss ${lossAccum.toFixed(2)}${ok.length ? "" : " (below target — best available)"}`,
       ok.length ? "info" : "warn",
     );
   } else {
@@ -361,6 +369,8 @@ async function runTrade() {
     stake = baseStake(chosen);
   }
   stake = Math.max(MIN_STAKE, round2(stake));
+  eng({ signal: `${label(chosen)} · ${chosen.reason}` });
+  addLog(`Entry signal on ${marketName(symbol)}: ${label(chosen)} — ${chosen.reason}`);
 
   const cfg = st.contracts[chosen.type];
   const contractParams: Record<string, any> = {
@@ -377,33 +387,22 @@ async function runTrade() {
   let payout: number;
   let cid: number;
   if (deriv.mode === "pat") {
-    // PAT: proposal (with underlying_symbol) -> buy by proposal id
     const prop = await deriv.send({ proposal: 1, ...contractParams, underlying_symbol: symbol });
     const proposalId = prop?.proposal?.id;
     if (!proposalId) throw new Error("Deriv did not return a proposal ID");
     payout = prop.proposal.payout as number;
-    if (recovering) {
-      const realCov = coverage(stake, payout / stake - 1, lossAccum);
-      addLog(`Payout ${payout.toFixed(2)} → real coverage ${(realCov * 100).toFixed(0)}%`);
-    }
     const buy = await deriv.send({ buy: proposalId, price: stake });
     cid = buy.buy.contract_id;
   } else {
-    // Legacy: direct buy with parameters
-    const buy = await deriv.send({
-      buy: 1,
-      price: stake,
-      parameters: { ...contractParams, symbol },
-    });
+    const buy = await deriv.send({ buy: 1, price: stake, parameters: { ...contractParams, symbol } });
     cid = buy.buy.contract_id;
     payout = Number(buy.buy.payout ?? 0);
   }
   const entryPrice = lastPrice[symbol] ?? 0;
-  addLog(`Bought ${label(chosen)} on ${marketName(symbol)} · stake ${stake.toFixed(2)} · payout ${payout.toFixed(2)}`);
+  addLog(`Bought ${label(chosen)} · stake ${stake.toFixed(2)} · payout ${payout.toFixed(2)}`);
 
   let profit: number;
   if (tickMode) {
-    // Every Tick: settle on the very next tick ourselves, no waiting for Deriv's settlement
     const next = await waitNextTick(symbol);
     const d = next.digit;
     const p = chosen.pred ?? 0;
@@ -417,12 +416,17 @@ async function runTrade() {
       next.price < entryPrice;
     profit = win ? payout - stake : -stake;
   } else {
-    profit = await new Promise<number>((resolve) => {
+    profit = await new Promise<number>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        off();
+        reject(new Error("Contract result timed out"));
+      }, 120_000);
       const off = deriv.onMessage((m) => {
         const poc = m.proposal_open_contract;
         if (m.msg_type !== "proposal_open_contract" || !poc || poc.contract_id !== cid) return;
         setState(() => ({ floating: poc.profit ?? 0 }));
         if (poc.is_sold) {
+          clearTimeout(timeout);
           off();
           resolve(Number(poc.profit));
         }
@@ -452,12 +456,12 @@ async function runTrade() {
 
   if (profit >= 0) {
     addLog(`WIN +${profit.toFixed(2)} on ${label(chosen)}`, "win");
-    if (lossAccum > 0) lossAccum = Math.max(0, round2(lossAccum - profit));
-    if (lossAccum <= 0) mgStep = 0;
-    else mgStep = 0; // win resets martingale chain
-    lossAccum = profit >= lossAccum ? 0 : lossAccum;
+    consecLosses = 0;
+    mgStep = 0;
+    lossAccum = 0;
   } else {
     addLog(`LOSS ${profit.toFixed(2)} on ${label(chosen)}`, "loss");
+    consecLosses++;
     hourTypeLosses[chosen.type] = (hourTypeLosses[chosen.type] ?? 0) + 1;
     if (st.mgEnabled) {
       lossAccum = round2(lossAccum - profit);
@@ -471,6 +475,6 @@ async function runTrade() {
   }
 }
 
-function label(c: Candidate) {
+function label(c: Signal) {
   return c.pred !== undefined ? `${c.type} ${c.pred}` : c.type;
 }
